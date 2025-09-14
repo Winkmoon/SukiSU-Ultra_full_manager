@@ -1,3 +1,5 @@
+（由ShirokoNeko随便搞的支持任意管理器的第三方仓库）
+
 # SukiSU Ultra
 <img align='right' src='SukiSU-mini.svg' width='220px' alt="sukisu logo">
 
