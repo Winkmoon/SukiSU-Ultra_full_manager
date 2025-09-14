@@ -7,6 +7,8 @@
 #include <linux/version.h>
 #include <linux/stat.h>
 #include <linux/namei.h>
+#include <linux/delay.h>
+#include <linux/sched.h>
 
 #include "allowlist.h"
 #include "klog.h" // IWYU pragma: keep
@@ -21,6 +23,8 @@ uid_t ksu_manager_uid = KSU_INVALID_UID;
 #define USER_DATA_BASE_PATH "/data/user_de"
 #define MAX_SUPPORTED_USERS 32 // Supports up to 32 users
 #define DATA_PATH_LEN 384 // 384 is enough for /data/app/<package>/base.apk and /data/user_de/{userid}/<package>
+#define MAX_SCAN_ENTRIES 1000
+#define SCAN_TIMEOUT_MS 5000
 
 struct uid_data {
 	struct list_head list;
@@ -33,6 +37,9 @@ struct user_scan_ctx {
 	uid_t user_id;
 	size_t pkg_count;
 	size_t error_count;
+	unsigned long start_time;
+	bool should_stop;
+	size_t max_entries;
 };
 
 struct user_dir_ctx {
@@ -45,6 +52,8 @@ struct user_id_ctx {
 	uid_t *user_ids;
 	size_t count;
 	size_t max_count;
+	unsigned long start_time;
+	bool timeout;
 };
 
 struct data_path {
@@ -68,6 +77,8 @@ struct my_dir_context {
 	void *private_data;
 	int depth;
 	int *stop;
+	unsigned long start_time;
+	size_t processed_count;
 };
 // https://docs.kernel.org/filesystems/porting.html
 // filldir_t (readdir callbacks) calling conventions have changed. Instead of returning 0 or -E... it returns bool now. false means "no more" (as -E... used to) and true - "keep going" (as 0 in old calling conventions). Rationale: callers never looked at specific -E... values anyway. -> iterate_shared() instances require no changes at all, all filldir_t ones in the tree converted.
@@ -80,6 +91,29 @@ struct my_dir_context {
 #define FILLDIR_ACTOR_CONTINUE 0
 #define FILLDIR_ACTOR_STOP -EINVAL
 #endif
+
+static inline bool should_yield_cpu(unsigned long start_time, size_t processed)
+{
+	if (time_after(jiffies, start_time + msecs_to_jiffies(100)) || 
+	    (processed % 50) == 0) {
+		return true;
+	}
+	return false;
+}
+
+static inline void safe_yield(void)
+{
+	if (in_atomic() || irqs_disabled()) {
+		cpu_relax();
+	} else {
+		cond_resched();
+	}
+}
+
+static inline bool is_operation_timeout(unsigned long start_time, unsigned int timeout_ms)
+{
+	return time_after(jiffies, start_time + msecs_to_jiffies(timeout_ms));
+}
 
 static int get_pkg_from_apk_path(char *pkg, const char *path)
 {
@@ -167,11 +201,17 @@ FILLDIR_RETURN_TYPE collect_user_ids(struct dir_context *ctx, const char *name,
 {
 	struct user_id_ctx *uctx = container_of(ctx, struct user_id_ctx, ctx);
 
+	if (is_operation_timeout(uctx->start_time, SCAN_TIMEOUT_MS)) {
+		pr_warn("collect_user_ids timeout, stopping scan\n");
+		uctx->timeout = true;
+		return FILLDIR_ACTOR_STOP;
+	}
+
 	// Skip non-directories and dot entries
 	if (d_type != DT_DIR || namelen <= 0)
 		return FILLDIR_ACTOR_CONTINUE;
 	if (name[0] == '.' && (namelen == 1 || (namelen == 2 && name[1] == '.')))
-		return FILLDIR_ACTOR_CONTINUE;;
+		return FILLDIR_ACTOR_CONTINUE;
 
 	// Parse numeric user ID
 	uid_t uid = 0;
@@ -186,6 +226,11 @@ FILLDIR_RETURN_TYPE collect_user_ids(struct dir_context *ctx, const char *name,
 		return FILLDIR_ACTOR_STOP;
 
 	uctx->user_ids[uctx->count++] = uid;
+
+	if ((uctx->count % 10) == 0) {
+		safe_yield();
+	}
+	
 	return FILLDIR_ACTOR_CONTINUE;
 }
 
@@ -207,11 +252,18 @@ static int get_active_user_ids(uid_t *user_ids, size_t max_users, size_t *found_
 		.ctx.actor = collect_user_ids,
 		.user_ids = user_ids,
 		.count = 0,
-		.max_count = max_users
+		.max_count = max_users,
+		.start_time = jiffies,
+		.timeout = false
 	};
 
 	ret = iterate_dir(dir_file, &uctx.ctx);
 	filp_close(dir_file, NULL);
+
+	if (uctx.timeout) {
+		pr_warn("User ID collection timed out\n");
+		ret = -ETIMEDOUT;
+	}
 
 	*found_count = uctx.count;
 	if (uctx.count > 0)
@@ -229,6 +281,21 @@ FILLDIR_RETURN_TYPE scan_user_packages(struct dir_context *ctx, const char *name
 	// Validate context and skip dot entries
 	if (!scan_ctx || !scan_ctx->uid_list)
 		return FILLDIR_ACTOR_STOP;
+
+	if (scan_ctx->should_stop || 
+	    is_operation_timeout(scan_ctx->start_time, SCAN_TIMEOUT_MS)) {
+		pr_warn("scan_user_packages timeout or stop requested (user %u)\n", 
+			scan_ctx->user_id);
+		scan_ctx->should_stop = true;
+		return FILLDIR_ACTOR_STOP;
+	}
+
+	if (scan_ctx->pkg_count >= scan_ctx->max_entries) {
+		pr_warn("Reached maximum entries limit %zu for user %u\n",
+			scan_ctx->max_entries, scan_ctx->user_id);
+		return FILLDIR_ACTOR_STOP;
+	}
+
 	if (d_type != DT_DIR || namelen <= 0)
 		return FILLDIR_ACTOR_CONTINUE;
 	if (name[0] == '.' && (namelen == 1 || (namelen == 2 && name[1] == '.')))
@@ -294,7 +361,13 @@ basically no mask and flags for =< 4.10
 	}
 
 	// Allocate and populate UID data entry
-	struct uid_data *uid_entry = kzalloc(sizeof(struct uid_data), GFP_KERNEL);
+	struct uid_data *uid_entry;
+	if (in_atomic() || irqs_disabled()) {
+		uid_entry = kzalloc(sizeof(struct uid_data), GFP_ATOMIC);
+	} else {
+		uid_entry = kzalloc(sizeof(struct uid_data), GFP_KERNEL);
+	}
+
 	if (!uid_entry) {
 		pr_err("Memory allocation failed for: %.*s\n", namelen, name);
 		scan_ctx->error_count++;
@@ -309,7 +382,11 @@ basically no mask and flags for =< 4.10
 	list_add_tail(&uid_entry->list, scan_ctx->uid_list);
 	scan_ctx->pkg_count++;
 
-	pr_info("Package: %s, UID: %u (user %u)\n", uid_entry->package, uid, scan_ctx->user_id);
+	if (should_yield_cpu(scan_ctx->start_time, scan_ctx->pkg_count)) {
+		safe_yield();
+	}
+
+	pr_debug("Package: %s, UID: %u (user %u)\n", uid_entry->package, uid, scan_ctx->user_id);
 	return FILLDIR_ACTOR_CONTINUE;
 }
 
@@ -334,7 +411,10 @@ static int scan_user_directory(uid_t user_id, struct list_head *uid_list,
 		.uid_list = uid_list,
 		.user_id = user_id,
 		.pkg_count = 0,
-		.error_count = 0
+		.error_count = 0,
+		.start_time = jiffies,
+		.should_stop = false,
+		.max_entries = MAX_SCAN_ENTRIES
 	};
 
 	struct user_dir_ctx uctx = {
@@ -347,6 +427,11 @@ static int scan_user_directory(uid_t user_id, struct list_head *uid_list,
 
 	*pkg_count = scan_ctx.pkg_count;
 	*error_count = scan_ctx.error_count;
+
+	if (scan_ctx.should_stop) {
+		pr_warn("User %u scan stopped early\n", user_id);
+		ret = -EINTR;
+	}
 
 	if (scan_ctx.pkg_count > 0 || scan_ctx.error_count > 0)
 		pr_info("User %u: %zu packages, %zu errors\n",
@@ -374,6 +459,10 @@ int scan_user_data_for_uids(struct list_head *uid_list)
 	// Scan each user's directory
 	for (size_t i = 0; i < active_users; i++) {
 		size_t pkg_count, error_count;
+
+		if (i > 0) {
+			safe_yield();
+		}
 
 		ret = scan_user_directory(user_ids[i], uid_list, &pkg_count, &error_count);
 		if (ret < 0) {
@@ -410,6 +499,19 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 		return FILLDIR_ACTOR_STOP;
 	}
 
+	if (is_operation_timeout(my_ctx->start_time, SCAN_TIMEOUT_MS)) {
+		pr_warn("my_actor timeout, stopping search\n");
+		if (my_ctx->stop) *my_ctx->stop = 1;
+		return FILLDIR_ACTOR_STOP;
+	}
+
+	my_ctx->processed_count++;
+	if (my_ctx->processed_count > MAX_SCAN_ENTRIES) {
+		pr_warn("Reached maximum entries limit in my_actor\n");
+		if (my_ctx->stop) *my_ctx->stop = 1;
+		return FILLDIR_ACTOR_STOP;
+	}
+
 	if (!strncmp(name, "..", namelen) || !strncmp(name, ".", namelen))
 		return FILLDIR_ACTOR_CONTINUE; // Skip "." and ".."
 
@@ -428,7 +530,12 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 
 	if (d_type == DT_DIR && my_ctx->depth > 0 &&
 	    (my_ctx->stop && !*my_ctx->stop)) {
-		struct data_path *data = kmalloc(sizeof(struct data_path), GFP_ATOMIC);
+		struct data_path *data;
+		if (in_atomic() || irqs_disabled()) {
+			data = kmalloc(sizeof(struct data_path), GFP_ATOMIC);
+		} else {
+			data = kmalloc(sizeof(struct data_path), GFP_KERNEL);
+		}
 
 		if (!data) {
 			pr_err("Failed to allocate memory for %s\n", dirpath);
@@ -464,7 +571,13 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 			if (is_multi_manager && (signature_index == DYNAMIC_SIGN_INDEX || signature_index >= 2)) {
 				crown_manager(dirpath, my_ctx->private_data, signature_index);
 
-				struct apk_path_hash *apk_data = kmalloc(sizeof(struct apk_path_hash), GFP_ATOMIC);
+				struct apk_path_hash *apk_data;
+				if (in_atomic() || irqs_disabled()) {
+					apk_data = kmalloc(sizeof(struct apk_path_hash), GFP_ATOMIC);
+				} else {
+					apk_data = kmalloc(sizeof(struct apk_path_hash), GFP_KERNEL);
+				}
+
 				if (apk_data) {
 					apk_data->hash = hash;
 					apk_data->exists = true;
@@ -472,7 +585,7 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 				}
 			} else if (is_manager_apk(dirpath)) {
 				crown_manager(dirpath, my_ctx->private_data, 0);
-				*my_ctx->stop = 1;
+				if (my_ctx->stop) *my_ctx->stop = 1;
 
 				// Manager found, clear APK cache list
 				list_for_each_entry_safe(pos, n, &apk_path_hash_list, list) {
@@ -480,7 +593,13 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 					kfree(pos);
 				}
 			} else {
-				struct apk_path_hash *apk_data = kmalloc(sizeof(struct apk_path_hash), GFP_ATOMIC);
+				struct apk_path_hash *apk_data;
+				if (in_atomic() || irqs_disabled()) {
+					apk_data = kmalloc(sizeof(struct apk_path_hash), GFP_ATOMIC);
+				} else {
+					apk_data = kmalloc(sizeof(struct apk_path_hash), GFP_KERNEL);
+				}
+				
 				if (apk_data) {
 					apk_data->hash = hash;
 					apk_data->exists = true;
@@ -488,6 +607,10 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 				}
 			}
 		}
+	}
+
+	if (should_yield_cpu(my_ctx->start_time, my_ctx->processed_count)) {
+		safe_yield();
 	}
 
 	return FILLDIR_ACTOR_CONTINUE;
@@ -501,6 +624,10 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
 	INIT_LIST_HEAD(&apk_path_hash_list);
 	unsigned long data_app_magic = 0;
 
+	unsigned long search_start_time = jiffies;
+
+	pr_info("Starting search_manager for path: %s, depth: %d\n", path, depth);
+
 	// Initialize APK cache list
 	struct apk_path_hash *pos, *n;
 	list_for_each_entry(pos, &apk_path_hash_list, list) {
@@ -513,16 +640,28 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
 	data.depth = depth;
 	list_add_tail(&data.list, &data_path_list);
 
-	for (i = depth; i >= 0; i--) {
+	for (i = depth; i >= 0 && !stop; i--) {
 		struct data_path *pos, *n;
+		size_t processed_in_level = 0;
+
+		if (is_operation_timeout(search_start_time, SCAN_TIMEOUT_MS * 2)) {
+			pr_warn("search_manager overall timeout, stopping\n");
+			stop = 1;
+			break;
+		}
 
 		list_for_each_entry_safe(pos, n, &data_path_list, list) {
-			struct my_dir_context ctx = { .ctx.actor = my_actor,
+			struct my_dir_context ctx = { 
+				.ctx.actor = my_actor,
 				.data_path_list = &data_path_list,
 				.parent_dir = pos->dirpath,
 				.private_data = uid_data,
 				.depth = pos->depth,
-						      .stop = &stop };
+				.stop = &stop,
+				.start_time = jiffies,
+				.processed_count = 0
+			};
+
 			struct file *file;
 
 			if (!stop) {
@@ -534,7 +673,7 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
 
 				// grab magic on first folder, which is /data/app
 				if (!data_app_magic) {
-					if (file->f_inode->i_sb->s_magic) {
+					if (file->f_inode && file->f_inode->i_sb && file->f_inode->i_sb->s_magic) {
 						data_app_magic = file->f_inode->i_sb->s_magic;
 						pr_info("%s: dir: %s got magic! 0x%lx\n", __func__, pos->dirpath, data_app_magic);
 					} else {
@@ -543,28 +682,56 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
 					}
 				}
 
-				if (file->f_inode->i_sb->s_magic != data_app_magic) {
+				if (file->f_inode && file->f_inode->i_sb && 
+				    file->f_inode->i_sb->s_magic != data_app_magic) {
 					pr_info("%s: skip: %s magic: 0x%lx expected: 0x%lx\n", __func__, pos->dirpath, 
 						file->f_inode->i_sb->s_magic, data_app_magic);
 					filp_close(file, NULL);
 					goto skip_iterate;
 				}
 
-				iterate_dir(file, &ctx.ctx);
+				int iterate_ret = iterate_dir(file, &ctx.ctx);
 				filp_close(file, NULL);
+
+				if (iterate_ret < 0) {
+					pr_warn("iterate_dir failed for %s: %d\n", pos->dirpath, iterate_ret);
+				}
+
+				processed_in_level++;
+				
+				if ((processed_in_level % 5) == 0) {
+					safe_yield();
+				}
 			}
+
 skip_iterate:
 			list_del(&pos->list);
 			if (pos != &data)
 				kfree(pos);
+
+			if (stop) {
+				pr_info("Stop flag set, breaking from search\n");
+				break;
+			}
+		}
+
+		if (i > 0) {
+			safe_yield();
 		}
 	}
 
-	// clear apk_path_hash_list unconditionally
 	pr_info("search manager: cleanup!\n");
+	// Remove stale cached APK entries
 	list_for_each_entry_safe(pos, n, &apk_path_hash_list, list) {
 		list_del(&pos->list);
 		kfree(pos);
+	}
+
+	struct data_path *path_pos, *path_n;
+	list_for_each_entry_safe(path_pos, path_n, &data_path_list, list) {
+		list_del(&path_pos->list);
+		if (path_pos != &data)
+			kfree(path_pos);
 	}
 }
 
@@ -587,6 +754,8 @@ static bool is_uid_exist(uid_t uid, char *package, void *data)
 void track_throne(void)
 {
 	struct list_head uid_list;
+	unsigned long track_start_time = jiffies;
+	
 	INIT_LIST_HEAD(&uid_list);
 	// scan user data for uids
 	int ret = scan_user_data_for_uids(&uid_list);
@@ -594,6 +763,11 @@ void track_throne(void)
 	if (ret < 0) {
 		pr_err("UserDE UID scan user data failed: %d.\n", ret);
 		goto out;
+	}
+
+	if (is_operation_timeout(track_start_time, SCAN_TIMEOUT_MS * 3)) {
+		pr_warn("track_throne: Overall timeout reached, stopping\n");
+		goto prune;
 	}
 
 	// now update uid list
